@@ -34,7 +34,7 @@ class XueqiuInputTests(unittest.TestCase):
             source = root / 'article.html'
             source.write_text('<h1 style="color:red">标题</h1><p>前文</p><img src="image.png"><h2>次标题</h2><p>后文</p>', encoding='utf-8')
             document = load_xueqiu_article(source)
-            self.assertEqual(document.images, [root / 'image.png'])
+            self.assertEqual(document.images, [(root / 'image.png').resolve()])
             self.assertEqual(document.sequence, ['标题', '前文', '\x00IMG\x00', '次标题', '后文'])
             self.assertEqual(document.tags['h4'], 2)
             self.assertNotIn('style=', document.content_html)
@@ -50,7 +50,7 @@ class XueqiuInputTests(unittest.TestCase):
             self.assertEqual(document.source_format, 'markdown')
             self.assertEqual(document.tags['h4'], 2)
             self.assertEqual(document.tags['strong'], 1)
-            self.assertEqual(document.images, [root / 'image.png'])
+            self.assertEqual(document.images, [(root / 'image.png').resolve()])
             self.assertLess(document.sequence.index('前文'), document.sequence.index('\x00IMG\x00'))
             self.assertGreater(document.sequence.index('后文'), document.sequence.index('\x00IMG\x00'))
 

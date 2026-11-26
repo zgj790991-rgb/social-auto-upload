@@ -201,8 +201,11 @@ class InstagramUploader:
             await navigation_popups.nth(1).click()
         finally:
             await page.remove_locator_handler(notifications)
-        dialog = page.get_by_role('dialog')
+        # 创建弹窗按“包含媒体输入框”识别；晚到的通知提示会让全页 dialog 计数变成 2。
+        dialog = page.get_by_role('dialog').filter(has=page.locator(INSTAGRAM_MEDIA_INPUT))
         await expect(dialog).to_have_count(1)
+        # 通知提示可能在点击创建之后才出现，此时上面的 locator handler 已摘除，需要再兜底关闭一次。
+        await _dismiss_optional_prompt(notifications, notification_buttons.nth(1))
         file_input = dialog.locator(INSTAGRAM_MEDIA_INPUT)
         await expect(file_input).to_have_count(1)
         paths = [self.video_file] if self.video_file else self.image_files
