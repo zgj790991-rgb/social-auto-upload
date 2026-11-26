@@ -195,3 +195,6 @@ videoFile
 
 # 本地个人使用的浏览器自动化开发 Skill，不随开源仓库发布
 /skills/browser-automation-dev/
+
+# 本机媒体矩阵入口（不提交上游）
+AGENTS.local.md

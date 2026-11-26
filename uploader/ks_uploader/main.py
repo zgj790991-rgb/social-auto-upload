@@ -4,6 +4,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import socket
+import ssl
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -32,6 +35,14 @@ KUAISHOU_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 KUAISHOU_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
 KUAISHOU_UPLOAD_TIMEOUT_SECONDS = 480
 KUAISHOU_PUBLISH_ATTEMPTS = 3
+KUAISHOU_CDN_HOST = "p66-plat.wsbkwai.com"
+KUAISHOU_CDN_PROBE_PATH = "/kos/nlav11104/static/ks-cp/js/chunk-vendors.1d009cbf.js"
+KUAISHOU_CDN_PROBE_BYTES = 262144
+KUAISHOU_CDN_PROBE_TIMEOUT = 4.5
+KUAISHOU_CDN_CACHE_TTL = 600.0
+KUAISHOU_GOTO_TIMEOUT_MS = 60000
+KUAISHOU_UPLOAD_BTN_TIMEOUT_MS = 45000
+_CDN_IP_CACHE: dict[str, tuple[float, str | None]] = {}
 
 
 def _msg(emoji: str, text: str) -> str:
@@ -221,17 +232,120 @@ async def _is_ks_login_page_gone(page: Page) -> bool:
         return True
 
 
+async def _probe_cdn_ip(ip: str, host: str, path: str, target_bytes: int) -> str:
+    """验证单个快手 CDN IP 的实际吞吐，避免被限速节点拖死页面加载。"""
+    ctx = ssl.create_default_context()
+    reader, writer = await asyncio.open_connection(ip, 443, ssl=ctx, server_hostname=host)
+    try:
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Range: bytes=0-{target_bytes - 1}\r\n"
+            f"Connection: close\r\n\r\n"
+        )
+        writer.write(req.encode())
+        await writer.drain()
+        status_line = await reader.readline()
+        if not (status_line.startswith(b"HTTP/1.1 200") or status_line.startswith(b"HTTP/1.1 206")):
+            raise RuntimeError(f"unexpected status: {status_line!r}")
+        received = 0
+        while received < target_bytes:
+            chunk = await reader.read(16384)
+            if not chunk:
+                break
+            received += len(chunk)
+        if received < target_bytes:
+            raise RuntimeError(f"short read: {received}")
+        return ip
+    finally:
+        writer.close()
+
+
+async def _pick_fast_cdn_ip(host: str = KUAISHOU_CDN_HOST) -> str | None:
+    """并发测速快手静态 CDN 的 IPv4 节点，返回首个跑通 256KB 的最快节点。"""
+    now = time.monotonic()
+    cached = _CDN_IP_CACHE.get(host)
+    if cached and (now - cached[0]) < KUAISHOU_CDN_CACHE_TTL:
+        return cached[1]
+
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, 443, family=socket.AF_INET, type=socket.SOCK_STREAM
+        )
+        ips = sorted({info[4][0] for info in infos})
+    except Exception:
+        return None
+
+    if len(ips) <= 1:
+        _CDN_IP_CACHE[host] = (now, None)
+        return None
+
+    tasks = [
+        asyncio.create_task(
+            asyncio.wait_for(
+                _probe_cdn_ip(ip, host, KUAISHOU_CDN_PROBE_PATH, KUAISHOU_CDN_PROBE_BYTES),
+                timeout=KUAISHOU_CDN_PROBE_TIMEOUT,
+            )
+        )
+        for ip in ips
+    ]
+    winner: str | None = None
+    try:
+        for fut in asyncio.as_completed(tasks):
+            try:
+                winner = await fut
+                break
+            except Exception:
+                continue
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    _CDN_IP_CACHE[host] = (now, winner)
+    return winner
+
+
+async def _launch_kuaishou_browser(
+    playwright: Playwright,
+    *,
+    headless: bool,
+    executable_path: str | None = None,
+):
+    """启动用于快手页面的浏览器，并在检测到更快 CDN 节点时跳过慢速节点。"""
+    fast_ip = await _pick_fast_cdn_ip()
+    launch_kwargs: dict = {"headless": headless}
+    if fast_ip:
+        launch_kwargs["args"] = [f"--host-resolver-rules=MAP {KUAISHOU_CDN_HOST} {fast_ip}"]
+    if executable_path:
+        launch_kwargs["executable_path"] = executable_path
+    else:
+        launch_kwargs["channel"] = "chromium"
+    return await playwright.chromium.launch(**launch_kwargs)
+
+
+async def _goto_kuaishou_upload(page: Page) -> None:
+    """快手新版上传页微前端较重，等待 domcontentloaded 并放宽导航超时。"""
+    await page.goto(
+        KUAISHOU_UPLOAD_URL,
+        wait_until="domcontentloaded",
+        timeout=KUAISHOU_GOTO_TIMEOUT_MS,
+    )
+
+
 async def cookie_auth(account_file):
     async with async_playwright() as playwright:
-        if LOCAL_CHROME_PATH:
-            browser = await playwright.chromium.launch(headless=True, executable_path=LOCAL_CHROME_PATH)
-        else:
-            browser = await playwright.chromium.launch(headless=True, channel="chromium")
+        browser = await _launch_kuaishou_browser(
+            playwright,
+            headless=True,
+            executable_path=LOCAL_CHROME_PATH or None,
+        )
         try:
             context = await browser.new_context(storage_state=account_file)
             context = await set_init_script(context)
             page = await context.new_page()
-            await page.goto(KUAISHOU_UPLOAD_URL)
+            await _goto_kuaishou_upload(page)
             await page.wait_for_timeout(3000)
 
             # 检查是否被重定向到登录页
@@ -248,7 +362,7 @@ async def cookie_auth(account_file):
             # 正向证明：上传按钮存在 = 真正已登录
             try:
                 upload_btn = page.locator("button[class^='_upload-btn']")
-                await upload_btn.wait_for(state="visible", timeout=10000)
+                await upload_btn.wait_for(state="visible", timeout=KUAISHOU_UPLOAD_BTN_TIMEOUT_MS)
                 kuaishou_logger.success(_msg("🥳", "cookie 有效"))
                 return True
             except Exception:
@@ -297,10 +411,11 @@ async def get_ks_cookie(
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
             should_close_context = False
         else:
-            if LOCAL_CHROME_PATH:
-                browser = await playwright.chromium.launch(headless=headless, executable_path=LOCAL_CHROME_PATH)
-            else:
-                browser = await playwright.chromium.launch(headless=headless, channel="chromium")
+            browser = await _launch_kuaishou_browser(
+                playwright,
+                headless=headless,
+                executable_path=LOCAL_CHROME_PATH or None,
+            )
             context = await browser.new_context()
             should_close_context = True
         context = await set_init_script(context)
@@ -620,29 +735,24 @@ class KSVideo(KSBaseUploader):
         await self.validate_upload_args()
         kuaishou_logger.info(_msg("🥳", "上传前检查通过"))
 
-        if self.local_executable_path:
-            browser = await playwright.chromium.launch(
-                headless=self.headless,
-                executable_path=self.local_executable_path,
-            )
-        else:
-            browser = await playwright.chromium.launch(
-                headless=self.headless,
-                channel="chromium",
-            )
+        browser = await _launch_kuaishou_browser(
+            playwright,
+            headless=self.headless,
+            executable_path=self.local_executable_path or None,
+        )
         context = await browser.new_context(storage_state=self.account_file)
         context = await set_init_script(context)
 
         upload_success = False
         try:
             page = await context.new_page()
-            await page.goto(KUAISHOU_UPLOAD_URL)
+            await _goto_kuaishou_upload(page)
             kuaishou_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
             kuaishou_logger.info(_msg("🧭", "小人正在赶往快手上传主页"))
             await page.wait_for_url(KUAISHOU_UPLOAD_URL_PATTERN)
 
             upload_button = page.locator("button[class^='_upload-btn']")
-            await upload_button.wait_for(state="visible", timeout=10000)
+            await upload_button.wait_for(state="visible", timeout=KUAISHOU_UPLOAD_BTN_TIMEOUT_MS)
 
             async with page.expect_file_chooser() as fc_info:
                 await upload_button.click()
@@ -794,12 +904,14 @@ class KSNote(KSBaseUploader):
     async def upload_note_content(self, page: Page) -> None:
         kuaishou_logger.info(_msg("🏃", f"小人开始搬运图文，共 {len(self.image_paths)} 张图片"))
         kuaishou_logger.info(_msg("🔀", "小人正在切换到图文发布"))
-        await page.locator('div[role="tablist"] div[role="tab"]:has-text("图文")').click()
+        note_tab = page.locator('div[role="tablist"] div[role="tab"]:has-text("图文")')
+        await note_tab.wait_for(state="visible", timeout=KUAISHOU_UPLOAD_BTN_TIMEOUT_MS)
+        await note_tab.click()
         await page.wait_for_timeout(1000)
 
         kuaishou_logger.info(_msg("📤", "小人正在上传图片"))
         upload_button = page.locator("button[class^='_upload-btn']").filter(has_text="上传图片")
-        await upload_button.wait_for(state="visible", timeout=10000)
+        await upload_button.wait_for(state="visible", timeout=KUAISHOU_UPLOAD_BTN_TIMEOUT_MS)
 
         async with page.expect_file_chooser() as fc_info:
             await upload_button.click()
@@ -881,23 +993,18 @@ class KSNote(KSBaseUploader):
         await self.validate_upload_args()
         kuaishou_logger.info(_msg("🥳", "图文上传前检查通过"))
 
-        if self.local_executable_path:
-            browser = await playwright.chromium.launch(
-                headless=self.headless,
-                executable_path=self.local_executable_path,
-            )
-        else:
-            browser = await playwright.chromium.launch(
-                headless=self.headless,
-                channel="chromium",
-            )
+        browser = await _launch_kuaishou_browser(
+            playwright,
+            headless=self.headless,
+            executable_path=self.local_executable_path or None,
+        )
         context = await browser.new_context(storage_state=self.account_file)
         context = await set_init_script(context)
 
         upload_success = False
         try:
             page = await context.new_page()
-            await page.goto(KUAISHOU_UPLOAD_URL)
+            await _goto_kuaishou_upload(page)
             kuaishou_logger.info(_msg("🧭", "小人正在赶往快手图文发布页"))
             await page.wait_for_url(KUAISHOU_UPLOAD_URL_PATTERN)
 

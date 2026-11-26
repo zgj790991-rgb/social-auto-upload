@@ -31,6 +31,13 @@ except Exception:
 STUDIO_URL = "https://studio.youtube.com"
 UPLOAD_URL = "https://www.youtube.com/upload"
 VISIBILITY = {"public": "PUBLIC", "unlisted": "UNLISTED", "private": "PRIVATE"}
+# Headless Chrome puts "HeadlessChrome" in the UA; YouTube Studio then shows an
+# "unsupported browser" interstitial and never redirects to /channel/.
+# Keep this in sync with the local Chrome major version when possible.
+_CHROME_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36"
+)
 
 
 def _msg(emoji: str, text: str) -> str:
@@ -52,11 +59,14 @@ async def cookie_auth(account_file) -> bool:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True, channel="chrome")
         try:
-            context = await browser.new_context(storage_state=account_file)
+            context = await browser.new_context(storage_state=account_file, user_agent=_CHROME_UA)
             context = await set_init_script(context)
             page = await context.new_page()
             await page.goto(STUDIO_URL, wait_until="domcontentloaded")
-            await page.wait_for_timeout(3000)
+            try:
+                await page.wait_for_url("**/channel/**", timeout=15000)
+            except Exception:
+                await page.wait_for_timeout(1000)
             url = page.url
             if "accounts.google.com" in url or "/signin" in url.lower():
                 return False
@@ -202,7 +212,7 @@ class YouTubeVideo(BaseVideoUploader):
             headless=self.headless, channel="chrome",
             proxy={"server": YT_PROXY} if YT_PROXY else None,
         )
-        context = await browser.new_context(storage_state=self.account_file)
+        context = await browser.new_context(storage_state=self.account_file, user_agent=_CHROME_UA)
         context = await set_init_script(context)
         page = await context.new_page()
         page.set_default_timeout(60000)
